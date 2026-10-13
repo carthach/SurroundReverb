@@ -2,33 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## First-Time Setup
-
-If the values below still say "Pamplejuce" or "Pamplejuce Demo", this project was freshly created from the template and hasn't been personalized yet. Ask the user:
-
-1. **What's your plugin called?** (display name for DAWs, e.g. "Super Synth")
-2. **What's your company name?** (e.g. "My Audio Co")
-3. **What type of plugin is this?** (synth, effect, utility, etc.)
-4. **What IDE do you use?** (CLion, VS Code, Xcode, other)
-5. **Do you want CI/CD via GitHub Actions?** Note: public repos get unlimited CI minutes, but private repos have a limited monthly allowance. If they're on a private repo and want to avoid burning minutes during active development, suggest commenting out matrix entries in the workflow to build on just one platform (e.g. only their dev OS) and running tests only — they can re-enable the full matrix when preparing a release.
-6. **If using CI, do you need Intel IPP?** (provides SIMD-optimized DSP functions — if not, comment out the IPP install steps in the workflow to avoid CI failures)
-7. **Are you code signing?** Code signing is essentially required to distribute to anyone (beta testers, friends, customers) — without it, macOS Gatekeeper and Windows SmartScreen will block or warn on the plugin. But it can be set up later; it's fine to skip during early development. Ask separately for macOS and Windows:
-   - **macOS**: codesigning + notarization requires an Apple Developer account ($99/year). If not signing yet, comment out the codesign/notarize steps in the CI workflow. Guide: [How to code sign and notarize macOS audio plugins in CI](https://melatonin.dev/blog/how-to-code-sign-and-notarize-macos-audio-plugins-in-ci/)
-   - **Windows**: Azure Trusted Signing is the recommended approach (free tier available). If not signing yet, comment out the Azure signing step. Guide: [Code signing on Windows with Azure Trusted Signing](https://melatonin.dev/blog/code-signing-on-windows-with-azure-trusted-signing/)
-
-Then:
-- Update `CMakeLists.txt`: set `PROJECT_NAME` (no spaces), `PRODUCT_NAME` (display name), `COMPANY_NAME`, `BUNDLE_ID`, `PLUGIN_MANUFACTURER_CODE` (4 chars), and `PLUGIN_CODE` (4 chars)
-- Let the user know: builds default to **Debug** mode for development (faster builds, better debugging). If they're making music with the plugin and experiencing performance issues (audio dropouts, high CPU), they should ask to build in **Release** mode instead.
-- Rewrite the **Build Commands** section below to match their IDE:
-  - **CLion**: use `cmake-build-debug` / `cmake-build-release` as build directories (CLion's defaults — sharing them avoids duplicate builds). Use `-G Ninja` with CLion's bundled ninja so the `.ninja_log` format stays compatible between CLI and IDE builds.
-  - **VS Code**: use `build` or `Builds` as the build directory. Recommend Ninja + the CMake Tools extension.
-  - **Xcode**: use `-G Xcode` and open the generated `.xcodeproj`. CLI builds can use `Builds` with Ninja.
-- If they don't want CI right now, comment out the platforms in the matrix they don't need
-- If they don't need IPP, comment out the IPP install steps in the workflow
-- If they're not code signing on a platform, comment out the relevant signing/notarization steps in the workflow
-- Remove this setup section from CLAUDE.md once complete
-
 ## About This Project
+
+**Surround Reverb** (by Carthach) is a multichannel reverb effect plugin. It runs on any speaker layout of up to 16 channels (stereo, 5.1, 7.1, 7.1.4, 9.1.6...) and can also take a mono or stereo input into a wider output.
 
 This project is derived from the [Pamplejuce](https://github.com/sudara/pamplejuce) template — a JUCE audio plugin template using CMake, C++23, and modern CI/CD. It builds cross-platform (macOS, Windows, Linux) with support for multiple plugin formats (VST3, AU, AUv3, CLAP, Standalone).
 
@@ -36,12 +12,25 @@ The template provides the build system, CI/CD, and project structure. The plugin
 
 ## Build Commands
 
+Builds default to **Debug** (faster builds, better debugging). Use Release when actually making music with the plugin: the Debug reverb uses several times more CPU.
+
+Day to day development happens in Xcode:
+
+```bash
+# Generate the Xcode project (run once, or after CMakeLists.txt changes), then open it
+cmake -B Builds-Xcode -G Xcode
+open Builds-Xcode/SurroundReverb.xcodeproj
+```
+
+Command line builds (this is what Claude should use) go in `Builds` with Ninja, so they never collide with the Xcode project:
+
 ```bash
 # Configure (run once, or after CMakeLists.txt changes)
-cmake -B Builds -DCMAKE_BUILD_TYPE=Debug
+cmake -B Builds -G Ninja -DCMAKE_BUILD_TYPE=Debug
 
-# Build
-cmake --build Builds --config Debug
+# Build everything, or just the tests
+cmake --build Builds
+cmake --build Builds --target Tests
 
 # Run tests (from project root)
 ctest --test-dir Builds --verbose --output-on-failure
@@ -49,20 +38,28 @@ ctest --test-dir Builds --verbose --output-on-failure
 # Or run tests directly
 ./Builds/Tests
 
-# Run a single test by name
-./Builds/Tests "[test name]"
+# Run a single test by name or tag
+./Builds/Tests "[engine]"
 
 # Run benchmarks
 ./Builds/Benchmarks
+
+# Validate the AU after a build
+auval -v aufx SRvb Cart
 ```
 
-For faster builds, add Ninja: `cmake -B Builds -G Ninja -DCMAKE_BUILD_TYPE=Debug`
+A full build copies the plugins into `~/Library/Audio/Plug-Ins` (`COPY_PLUGIN_AFTER_BUILD`). AUv3 is only built by the Xcode generator.
+
+For a Release build: `cmake -B Builds-Release -G Ninja -DCMAKE_BUILD_TYPE=Release`
 
 On macOS for universal binary: `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"`
 
 ## Project Structure
 
-- `source/` - Plugin source code (PluginProcessor, PluginEditor)
+- `source/` - Plugin source code
+  - `ReverbEngine` - The DSP. Depends only on `juce_audio_basics`, knows nothing about the plugin
+  - `PluginProcessor` - Parameters, bus layouts, state, and mapping JUCE channel sets onto the engine
+  - `PluginEditor` - The UI: knobs, look and feel, output meters
 - `tests/` - Catch2 test files
 - `benchmarks/` - Catch2 benchmark files
 - `cmake/` - CMake modules (Tests.cmake, Benchmarks.cmake, Assets.cmake, etc.)
@@ -72,6 +69,14 @@ On macOS for universal binary: `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"`
 - `packaging/` - Installer resources and scripts
 
 ## Architecture
+
+**Reverb**: `ReverbEngine` is a 16 line feedback delay network with a Hadamard feedback matrix. Each input channel goes through pre-delay, low/high cut filters and three allpass diffusers, then drives every line using its own Hadamard row as the sign pattern. Each speaker reads its own disjoint set of lines, which is what keeps the outputs decorrelated. Per line: a modulated cubic-interpolated delay, a gain that sets the RT60, and a low and a high shelf that scale the decay time in their bands (the damping ratios). The ratios are capped at 2 because that is what keeps the loop gain below 1, so don't widen that range. `README.md` explains the approach in full, with references: keep it in step with the DSP.
+
+**LFE**: LFE inputs only drive the reverb through the LFE send, and LFE outputs only get reverb (a 120 Hz lowpassed mix of all lines) through the LFE return. Both default to off. The dry LFE follows the mix like any other channel.
+
+**Layouts**: `PluginProcessor::makeEngineLayout` turns the bus layout into a `ReverbEngine::Layout`: a `Role` per input and output (front, centre, surround, height, lfe), which decides which level control it answers to, and where each input's dry signal goes. `PluginProcessor::isLayoutSupported` is the single source of truth for which layouts are allowed (no ambisonics).
+
+**Parameters**: All live in the `AudioProcessorValueTreeState` (`PluginProcessor::state`), with IDs in the `ParameterIDs` namespace. `processBlock` reads them once per block into a `ReverbEngine::Parameters`, and the engine does its own smoothing. Parameter IDs and ranges are part of saved sessions, so don't rename or rescale them casually.
 
 **SharedCode Library**: The `SharedCode` INTERFACE library links plugin source code to both the main plugin target and the Tests target, avoiding ODR violations.
 
@@ -102,6 +107,15 @@ Edit `CMakeLists.txt` to customize:
 - `PLUGIN_MANUFACTURER_CODE` / `PLUGIN_CODE` - 4-character plugin IDs
 
 Version is read from the `VERSION` file in project root.
+
+The macOS deployment target is 12.0, set in `CMakeLists.txt` right after `include(PamplejuceMacOS)`. The template's 10.14 can't be used: Xcode 27 won't generate a project for anything older than 12.0.
+
+## CI
+
+`.github/workflows/build_and_test.yml` builds, tests and runs pluginval on macOS, Windows and Linux. Currently disabled, as commented out steps that can be restored:
+- **Intel IPP** - the install steps, `IPP_DIR`, and `include(PamplejuceIPP)` in `CMakeLists.txt`
+- **macOS code signing and notarization** - the macOS installer is built unsigned
+- **Windows code signing** (Azure Trusted Signing)
 
 ## Code Quality
 
